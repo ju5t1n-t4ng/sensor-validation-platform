@@ -1,7 +1,5 @@
 // sensor_data.h
-// Sensor data structures and classes
-// This headerfile defines the SensorData class. Every sensor in this project produces a SensorData object.
-// Updated Phase 2: added SystemState enum  
+// Phase 3: added fault reason tracking and recovery state
 
 #ifndef SENSOR_DATA_H
 #define SENSOR_DATA_H
@@ -22,6 +20,14 @@ enum SystemState {
     STATE_CRITICAL,
     STATE_SENSOR_FAULT,
     STATE_SAFE
+};
+
+// Reason the system entered SAFE, logged at transition
+enum SafeReason {
+    SAFE_NONE,
+    SAFE_CRITICAL_TIMEOUT, // Sustained critical condition
+    SAFE_SENSOR_FAULT, // fault persisted
+    SAFE_WATCHDOG //Stalled main loop
 };
 
 struct SensorData {

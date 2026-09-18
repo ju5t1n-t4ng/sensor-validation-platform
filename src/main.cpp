@@ -1,11 +1,8 @@
 // Real-Time Sensor Acquisition, Validation & Fault-Tolerant Control Platform
-// This project is a real-time sensor acquisition, validation, and fault-tolerant control platform. It is designed to acquire data from various sensors, validate the readings, and provide fault-tolerant control mechanisms based on the sensor data.
-// Phase 2 — System state machine
-
-//Architecture: loop() -> acquireSensors() -> validateData() -> evaluateState() -> controlActuators()
+// Phase 3 - Fault-tolerant control
 
 #include <Wire.h>
-#include <Adafruit_BMP085.h>   // BMP180 uses the BMP085 library
+#include <Adafruit_BMP085.h>
 #include "sensor_data.h"
 
 // Pin Definitions -------------------------------------------------------------------------------------------------------
@@ -14,24 +11,25 @@ const int LED_PIN = 26;
 const int MOTOR_PIN = 25;
 
 // Timing Variables -------------------------------------------------------------------------------------------------------
-const unsigned long SAMPLE_INTERVAL = 100;    // ms between sensor readings
-const unsigned long STALE_TIMEOUT = 2000;    // ms before sensor data is stale
-const unsigned long SAFE_ENTRY_DELAY  = 2000;  // ms in CRITICAL before SAFE
+const unsigned long SAMPLE_INTERVAL = 100;
+const unsigned long STALE_TIMEOUT = 2000;
+const unsigned long SAFE_ENTRY_DELAY  = 2000; // ms in CRITICAL/FAULT before SAFE
+const unsigned long RECOVERY_DURATION = 3000; // ms before recovery allowed
+const unsigned long WATCHDOG_TIMEOUT = 500; // ms before watchdog activates
+
 unsigned long lastSampleTime = 0;
-unsigned long criticalEntryTime = 0;    // When CRITICAL was entered
+unsigned long criticalEntryTime = 0;
+unsigned long faultEntryTime = 0;
+unsigned long recoveryStartTime = 0;
+unsigned long lastLoopTime = 0;
 
 // Validation Thresholds -------------------------------------------------------------------------------------------------------
-// BMP180 Sensor operating limits
 const float TEMP_MIN = -40.0;
 const float TEMP_MAX = 80.0;
 const float PRESSURE_MIN = 300.0;
 const float PRESSURE_MAX = 1100.0;
-
-// Maximum realistic rate of change per 100ms sample interval
 const float TEMP_MAX_DELTA = 10.0;    // degrees C per sample current values for simulation purposes // Real hardware value: ~0.5°C per 100ms
 const float PRESSURE_MAX_DELTA = 50.0;    // hPa per sample // Real hardware value: ~2.0 hPa per 100ms
-
-// Fault counter threshold, consecutive failed validations before fault declared
 const int FAULT_THRESHOLD = 3;
 
 // Operational Thresholds ---------------------------------------------------------------------------------------------------------
@@ -53,6 +51,8 @@ SensorData analogData;
 // System State ---------------------------------------------------------------------
 SystemState currentState = STATE_NORMAL;
 SystemState previousState = STATE_NORMAL;
+SafeReason safeReason = SAFE_NONE;
+bool inRecovery = false;
 
 // Function Declarations -------------------------------------------------------------------------------------------------------
 void acquireSensors();
@@ -60,10 +60,13 @@ void validateData();
 void validateSensor(SensorData &sensor, float minVal, float maxVal, float maxDelta);
 void evaluateState();
 SystemState determineState();
+bool checkRecoveryConditions();
+void enterSafe(SafeReason reason);
 void controlActuators();
 void logData();
 String healthStr(SensorHealth h);
 String stateStr(SystemState s);
+String safeReasonStr(SafeReason r);
 
 // -------------------------------------------------------------------------------------------------------
 void setup() {
@@ -71,7 +74,7 @@ void setup() {
     pinMode(MOTOR_PIN, OUTPUT);
     Serial.begin(115200);
 
-    Serial.println("RT Sensor Platform - Phase 2");
+    Serial.println("RT Sensor Platform - Phase 3");
     Serial.println("Initializing...");
 
     if (!bmp.begin(0x77)) {
@@ -79,25 +82,36 @@ void setup() {
         while (1);
     }
 
-    // Seed intial values from first sensor reading
-    // Prevents false rate of change faults at startup
+    // Seed from first real read
     float initialTemp = bmp.readTemperature();
-    float initialPress = bmp.readPressure() / 100.0;
+    float initialPressure = bmp.readPressure() / 100.0;
 
     temperatureData = {initialTemp, initialTemp, millis(), millis(), false, SENSOR_DISCONNECTED, 0};
-    pressureData = {initialPress, initialPress, millis(), millis(), false, SENSOR_DISCONNECTED, 0};
+    pressureData = {initialPressure, initialPressure, millis(), millis(), false, SENSOR_DISCONNECTED, 0};
     analogData = {0, 0, 0, 0, false, SENSOR_UNINITIALIZED, 0};
 
-    Serial.println("BMP180 initialized.");
+    lastLoopTime = millis();
+
+    Serial.print("Initial temp: ");     Serial.println(initialTemp);
+    Serial.print("Initial pressure: "); Serial.println(initialPressure);
     Serial.println("System ready.");
     Serial.println();
-    Serial.println("Time(ms)  | Temp(C) | Pressure(hPa) | Analog | T-Health | P-Health");
-    Serial.println("----------|---------|---------------|--------|----------|----------");
+    Serial.println("Time(ms)  | Temp  | Pressure | Analog | State        | T-Health | FC");
+    Serial.println("----------|-------|----------|--------|--------------|----------|----");
 }
 
 // -------------------------------------------------------------------------------------------------------
 void loop() {
     unsigned long currentTime = millis();
+
+    // Watchdog check -------------------------------------
+    // If loop stalls, this executes on next execution
+    if (currentTime - lastLoopTime > WATCHDOG_TIMEOUT) {
+        if (currentState != STATE_SAFE) {
+            enterSafe (SAFE_WATCHDOG);
+        }
+    }
+    lastLoopTime = currentTime;
 
     if (currentTime - lastSampleTime >= SAMPLE_INTERVAL) {
         lastSampleTime = currentTime;
@@ -111,8 +125,6 @@ void loop() {
 }
 
 // Acqusition Part -------------------------------------------------------------------------------------------------------
-// Responsible for reading sensors, timestamping, and detectin comm failures
-// Not responsible for validating the data, just acquiring it
 void acquireSensors() {
     unsigned long timestamp = millis();
 
@@ -185,22 +197,37 @@ void evaluateState() {
     previousState = currentState;
 
     // SAFE is a latch, only exists via reset
-    // Phase 3 will add recovery mechanism
     if (currentState == STATE_SAFE) {
+        if (checkRecoveryConditions()) {
+            currentState = STATE_NORMAL;
+            safeReason = SAFE_NONE;
+            inRecovery = false;
+            Serial.println(">>> RECOVERY COMPLETE — returning to NORMAL <<<");
+        }
         return;
     }
 
     SystemState newState = determineState();
 
-    // Track when CRITICAL was first entered
+    // Track CRITICAL entry time
     if (newState == STATE_CRITICAL && previousState != STATE_CRITICAL) {
         criticalEntryTime = millis();
     }
 
-    // Enter SAFE if CRITICAL persists beyond delay
+    // Track SENSOR_FAULT entry time
+    if (newState == STATE_SENSOR_FAULT && previousState != STATE_SENSOR_FAULT) {
+        faultEntryTime = millis();
+    }
+
+    // Enter SAFE from CRITICAL after delay
     if (newState == STATE_CRITICAL && millis() - criticalEntryTime >= SAFE_ENTRY_DELAY) {
-        currentState = STATE_SAFE;
-        Serial.println(">>> SAFE STATE ENTERED — actuators disabled <<<");
+        enterSafe(SAFE_CRITICAL_TIMEOUT);
+        return;
+    }
+
+    // Enter SAFE from SENSOR_FAULT after delay
+    if (newState == STATE_SENSOR_FAULT && millis() - faultEntryTime >= SAFE_ENTRY_DELAY) {
+        enterSafe(SAFE_SENSOR_FAULT);
         return;
     }
 
@@ -215,17 +242,48 @@ void evaluateState() {
     }
 }
 
-// State Determination ---------------------------------------------------------------------------------------------------
-// Evaluated highest priority to lowest
-// Only uses validated data — invalid readings cannot command state
+// Enter Safe State ---------------------------------------------------------------------------------------------
+void enterSafe(SafeReason reason) {
+    currentState = STATE_SAFE;
+    safeReason = reason;
+    inRecovery = false;
 
+    Serial.print(">>> SAFE STATE ENTERED — reason: ");
+    Serial.println(safeReasonStr(reason));
+}
+
+// Recovery Condtitions ------------------------------------------------------------------------------------------
+// System must observe stable conditions for RECOVERY_DURATION before being allowed to exit SAFE
+
+bool checkRecoveryConditions() {
+    bool sensorsHealthy = (temperatureData.health == SENSOR_OK && pressureData.health == SENSOR_OK);
+    bool readingsNormal = (temperatureData.value < TEMP_WARNING && pressureData.value > PRESSURE_WARNING && analogData.value < ANALOG_WARNING);
+    bool noActiveFaults = (temperatureData.faultCount == 0 && pressureData.faultCount == 0);
+    bool recoveryReady = sensorsHealthy && readingsNormal && noActiveFaults;
+
+    // Start recovery timer when conditions first met
+    if (recoveryReady && !inRecovery) {
+        inRecovery = true;
+        recoveryStartTime = millis();
+        Serial.println(">>> Recovery conditions met — monitoring...");
+    }
+
+    // Reset if conditions lost during recovery window
+    if (!recoveryReady && inRecovery) {
+        inRecovery = false;
+        Serial.println(">>> Recovery conditions lost — reset timer");
+    }
+
+    // Recovery complete if conditions held for full duration
+    return (inRecovery && millis() - recoveryStartTime >= RECOVERY_DURATION);
+}
+
+// State Determination ---------------------------------------------------------------------------------------------------
 SystemState determineState() {
     // SENSOR_FAULT
     bool sensorFault = (temperatureData.faultCount >= FAULT_THRESHOLD || pressureData.faultCount >= FAULT_THRESHOLD);
     if (sensorFault) return STATE_SENSOR_FAULT;
 
-    // Only use valid readings for operational state
-    // If sensor is invalid but below fault threshold — hold WARNING
     if (!temperatureData.valid || !pressureData.valid) return STATE_WARNING;
 
     // CRITICAL
@@ -242,6 +300,9 @@ SystemState determineState() {
 }
 
 // Actuator Control -------------------------------------------------------------------------------------------------------
+// All actuator commands flow through system state
+// No sensor value ever directly commands an actuator
+
 void controlActuators() {
     switch (currentState) {
         case STATE_NORMAL:
@@ -256,25 +317,22 @@ void controlActuators() {
         
         case STATE_CRITICAL:
             analogWrite(MOTOR_PIN, 50);
-            // LED flashes in CRITICAL
             digitalWrite(LED_PIN, (millis() / 250) % 2);
             break;
 
         case STATE_SENSOR_FAULT:
             analogWrite(MOTOR_PIN, 0);
-            // Fast flash for sensor fault
             digitalWrite(LED_PIN, (millis() / 100) % 2);
             break;
 
         case STATE_SAFE:
             analogWrite(MOTOR_PIN, 0);
-            // Slow flash for safe state
             digitalWrite(LED_PIN, (millis() / 500) % 2);
             break;
     }
 }
 
-// Helper: health status to string
+// Helper Functions ----------------------------------------------------------------------------
 String healthStr(SensorHealth h) {
     switch (h) {
         case SENSOR_OK:            return "OK        ";
@@ -297,6 +355,16 @@ String stateStr(SystemState s) {
     }
 }
 
+String safeReasonStr(SafeReason r) {
+    switch (r) {
+        case SAFE_NONE:             return "NONE";
+        case SAFE_CRITICAL_TIMEOUT: return "CRITICAL timeout";
+        case SAFE_SENSOR_FAULT:     return "SENSOR_FAULT timeout";
+        case SAFE_WATCHDOG:         return "WATCHDOG fired";
+        default:                    return "UNKNOWN";
+  }
+}
+
 
 // Telemetry Logging -------------------------------------------------------------------------------------------------------
 void logData() {
@@ -310,7 +378,7 @@ void logData() {
   Serial.print("   | ");
   Serial.print(stateStr(currentState));
   Serial.print(" | ");
-  Serial.println(healthStr(temperatureData.health));
-  Serial.print(" | FC=");
+  Serial.print(healthStr(temperatureData.health));
+  Serial.print(" | ");
   Serial.println(temperatureData.faultCount);
 }
