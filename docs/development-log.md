@@ -75,3 +75,27 @@ const float PRESSURE_MAX_DELTA = 50.0;  // Relaxed for Wokwi — real HW: ~2.0 h
 | `SAFE` only latches from `CRITICAL`, not `SENSOR_FAULT` | Phase 3 |
 | No watchdog timer | Phase 3 |
 | No FreeRTOS task scheduling | Phase 4 |
+
+---
+
+## Phase 4
+
+### Issue 5 — Motor Actuator Response Unverifiable in Wokwi
+**Problem:** Cannot visually confirm motor speed changes in response to state transitions.
+**Root Cause:** Wokwi stepper motor does not respond to `analogWrite()` as a DC motor would. PWM commands are issued correctly by ControlTask but produce no meaningful visual feedback.
+**Fix:** Used LED flash patterns as actuator proxy — confirms ControlTask is executing and responding to state changes correctly.
+**Deferred:** Full motor actuator verification deferred to physical hardware build with DC motor + L298N driver.
+
+---
+
+## Phase 4 Design Decisions
+
+**`vTaskDelayUntil()` over `vTaskDelay()`** — `vTaskDelay()` waits a fixed time after the task finishes, making the actual period dependent on execution time. `vTaskDelayUntil()` wakes at an absolute tick count, keeping timing deterministic regardless of how long the task took.
+
+**Mutex on all shared data** — sensor data and system state are accessed by multiple tasks concurrently. Without mutex protection, a task could read partially-written data mid-update — a race condition that produces corrupted values silently.
+
+**Watchdog via semaphore** — sensor task feeds a semaphore every cycle. Watchdog task times out if semaphore not received within 500ms. Decouples watchdog logic from sensor task entirely — sensor task does not need to know a watchdog exists.
+
+**Telemetry at lowest priority** — serial output is slow. Running it at priority 1 ensures it can never block the control task (priority 4) or sensor task (priority 3), keeping timing deadlines intact.
+
+**loop() suspended** — `vTaskDelay(portMAX_DELAY)` in `loop()` prevents it from consuming CPU time. FreeRTOS scheduler owns execution after `setup()` completes.
