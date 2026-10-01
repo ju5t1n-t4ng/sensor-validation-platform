@@ -1,5 +1,5 @@
 // Real-Time Sensor Acquisition, Validation & Fault-Tolerant Control Platform
-// Phase 3 - FreeRTOS real-time scheduling
+// Phase 4 - FreeRTOS real-time scheduling
 
 // Task Architechture: 
 // SensorTask ──► ValidationTask ──► ControlTask
@@ -315,7 +315,7 @@ void ControlTask(void *pvParameters) {
         controlMetrics.missedDeadlines++;
         }
 
-        vTaskDelayUntil(&lastWakeTime, pdMS_TO_TICKS(10));
+        vTaskDelayUntil(&lastWakeTime, pdMS_TO_TICKS(5));
     }
 }
 
@@ -415,11 +415,11 @@ void validateSensor(SensorData &sensor, float minVal, float maxVal, float maxDel
         sensor.lastUpdate = millis();
         return;
     }
-    sensor.valid          = true;
-    sensor.health         = SENSOR_OK;
-    sensor.faultCount     = 0;
+    sensor.valid = true;
+    sensor.health = SENSOR_OK;
+    sensor.faultCount = 0;
     sensor.lastValidValue = sensor.value;
-    sensor.lastUpdate     = millis();
+    sensor.lastUpdate = millis();
 }
 
 // Enter Safe State 
