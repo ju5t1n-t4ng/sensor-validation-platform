@@ -1,4 +1,4 @@
-# Real-Time Sensor Acquisition, Validation & Fault-Tolerant Control Platform
+# Real-Time Sensor Acquisition, Validation & Fault-Tolerant Control System
 
 A real-time embedded systems project built on the ESP32 using FreeRTOS. The system acquires data from multiple sensors, validates every measurement before trusting it, manages system health through a five-state state machine, and responds to faults safely — including sustained critical conditions, sensor failures, and watchdog timeouts.
 
