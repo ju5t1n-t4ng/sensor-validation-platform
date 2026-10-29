@@ -99,3 +99,5 @@ const float PRESSURE_MAX_DELTA = 50.0;  // Relaxed for Wokwi — real HW: ~2.0 h
 **Telemetry at lowest priority** — serial output is slow. Running it at priority 1 ensures it can never block the control task (priority 4) or sensor task (priority 3), keeping timing deadlines intact.
 
 **loop() suspended** — `vTaskDelay(portMAX_DELAY)` in `loop()` prevents it from consuming CPU time. FreeRTOS scheduler owns execution after `setup()` completes.
+
+**Queues stay in the code for now, wait for further implementation.
